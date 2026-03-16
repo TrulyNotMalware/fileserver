@@ -1,28 +1,47 @@
 package internal
 
 import (
+	"database/sql"
+	"fileServer/internal/auth"
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 )
 
 type Server struct {
-	host      string
-	port      string
-	staticDir string
-	mux       *http.ServeMux
+	host            string
+	port            string
+	staticDir       string
+	mux             *http.ServeMux
+	db              *sql.DB
+	jwtManager      *auth.JWTManager
+	accessTokenTTL  time.Duration
+	refreshTokenTTL time.Duration
 }
 
-func NewServer(host, port, staticDir string, perm os.FileMode, mode string) (*Server, error) {
+func NewServer(
+	host, port, staticDir string,
+	perm os.FileMode,
+	mode string,
+	database *sql.DB,
+	jwtManager *auth.JWTManager,
+	accessTokenTTL time.Duration,
+	refreshTokenTTL time.Duration,
+) (*Server, error) {
 	if err := prepareStaticDir(staticDir, perm, mode); err != nil {
 		return nil, err
 	}
 
 	s := &Server{
-		host:      host,
-		port:      port,
-		staticDir: staticDir,
-		mux:       http.NewServeMux(),
+		host:            host,
+		port:            port,
+		staticDir:       staticDir,
+		mux:             http.NewServeMux(),
+		db:              database,
+		jwtManager:      jwtManager,
+		accessTokenTTL:  accessTokenTTL,
+		refreshTokenTTL: refreshTokenTTL,
 	}
 	s.routes()
 	return s, nil
@@ -41,8 +60,14 @@ func prepareStaticDir(dir string, perm os.FileMode, mode string) error {
 }
 
 func (s *Server) routes() {
+	authHandler := auth.NewHandler(s.db, s.jwtManager, s.accessTokenTTL, s.refreshTokenTTL)
+
+	s.mux.HandleFunc("POST /auth/login", authHandler.Login)
+	s.mux.HandleFunc("POST /auth/refresh", authHandler.Refresh)
+	s.mux.HandleFunc("POST /auth/logout", authHandler.Logout)
+
 	fs := http.FileServer(http.Dir(s.staticDir))
-	s.mux.Handle("GET /", fs)
+	s.mux.Handle("GET /", auth.JWTMiddleware(s.jwtManager)(fs))
 }
 
 func (s *Server) Run() error {

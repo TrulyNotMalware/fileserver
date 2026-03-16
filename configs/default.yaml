@@ -7,3 +7,10 @@ server:
 
 logging:
   level: "INFO"
+
+auth:
+  private_key_path: ""
+  access_token_ttl: "15m"
+  refresh_token_ttl: "168h"
+  admin_password: ""
+  guest_password: ""
