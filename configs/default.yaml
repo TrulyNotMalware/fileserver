@@ -9,8 +9,8 @@ logging:
   level: "INFO"
 
 auth:
-  private_key_path: ""
+  private_key_path: "/app/private.pem"
   access_token_ttl: "15m"
   refresh_token_ttl: "168h"
-  admin_password: ""
-  guest_password: ""
+  admin_password: "admin12345"
+  guest_password: "guest12345"

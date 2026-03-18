@@ -2,6 +2,7 @@ package auth
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fileServer/internal/db"
 	"net/http"
@@ -9,6 +10,8 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 )
+
+const refreshTokenCookieName = "refresh_token"
 
 type Handler struct {
 	db              *sql.DB
@@ -28,20 +31,25 @@ func NewHandler(database *sql.DB, jwtManager *JWTManager, accessTTL, refreshTTL 
 
 type loginRequest struct {
 	Username string `json:"username"`
-	Password string `json:"password"`
+	Password string `json:"password"` // base64(RSA encrypted password)
 }
 
 type tokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
+	AccessToken string `json:"access_token"`
 }
 
-type refreshRequest struct {
-	RefreshToken string `json:"refresh_token"`
+type publicKeyResponse struct {
+	PublicKey string `json:"public_key"`
 }
 
-type logoutRequest struct {
-	RefreshToken string `json:"refresh_token"`
+func (h *Handler) PublicKey(w http.ResponseWriter, r *http.Request) {
+	pubPEM, err := h.jwtManager.PublicKeyPEM()
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, publicKeyResponse{PublicKey: pubPEM})
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
@@ -51,13 +59,25 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ciphertext, err := base64.StdEncoding.DecodeString(req.Password)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	plainPassword, err := h.jwtManager.DecryptPassword(ciphertext)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	user, err := db.GetUserByUsername(h.db, req.Username)
 	if err != nil || user == nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(plainPassword)); err != nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -80,33 +100,34 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, tokenResponse{
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-	})
+	setRefreshTokenCookie(w, refreshToken, expiresAt)
+	writeJSON(w, http.StatusOK, tokenResponse{AccessToken: accessToken})
 }
 
 func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
-	var req refreshRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
-		return
-	}
-
-	claims, err := h.jwtManager.Verify(req.RefreshToken)
+	cookie, err := r.Cookie(refreshTokenCookieName)
 	if err != nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	userID, expiresAt, err := db.GetRefreshToken(h.db, req.RefreshToken)
+	refreshToken := cookie.Value
+
+	claims, err := h.jwtManager.Verify(refreshToken)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	userID, expiresAt, err := db.GetRefreshToken(h.db, refreshToken)
 	if err != nil || userID == 0 {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	if time.Now().After(expiresAt) {
-		_ = db.DeleteRefreshToken(h.db, req.RefreshToken)
+		_ = db.DeleteRefreshToken(h.db, refreshToken)
+		clearRefreshTokenCookie(w)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -117,25 +138,43 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, tokenResponse{
-		AccessToken:  accessToken,
-		RefreshToken: req.RefreshToken,
-	})
+	writeJSON(w, http.StatusOK, tokenResponse{AccessToken: accessToken})
 }
 
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
-	var req logoutRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+	cookie, err := r.Cookie(refreshTokenCookieName)
+	if err != nil {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	if err := db.DeleteRefreshToken(h.db, req.RefreshToken); err != nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-
+	_ = db.DeleteRefreshToken(h.db, cookie.Value)
+	clearRefreshTokenCookie(w)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func setRefreshTokenCookie(w http.ResponseWriter, token string, expiresAt time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     refreshTokenCookieName,
+		Value:    token,
+		Expires:  expiresAt,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		Path:     "/auth",
+	})
+}
+
+func clearRefreshTokenCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     refreshTokenCookieName,
+		Value:    "",
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		Path:     "/auth",
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

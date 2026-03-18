@@ -1,7 +1,11 @@
 package auth
 
 import (
+	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"os"
 	"time"
@@ -36,6 +40,28 @@ func NewJWTManager(privateKeyPath string) (*JWTManager, error) {
 		privateKey: privateKey,
 		publicKey:  &privateKey.PublicKey,
 	}, nil
+}
+
+func (m *JWTManager) PublicKeyPEM() (string, error) {
+	pubDER, err := x509.MarshalPKIXPublicKey(m.publicKey)
+	if err != nil {
+		return "", err
+	}
+
+	pubPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: pubDER,
+	})
+
+	return string(pubPEM), nil
+}
+
+func (m *JWTManager) DecryptPassword(ciphertext []byte) (string, error) {
+	plaintext, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, m.privateKey, ciphertext, nil)
+	if err != nil {
+		return "", errors.New("failed to decrypt password")
+	}
+	return string(plaintext), nil
 }
 
 func (m *JWTManager) IssueAccessToken(userID int64, username, role string, ttl time.Duration) (string, error) {
