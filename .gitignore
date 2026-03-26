@@ -31,5 +31,5 @@ go.work.sum
 .idea/
 
 # Builds
-./build/bin
-./build/keys
+build/bin
+build/keys
