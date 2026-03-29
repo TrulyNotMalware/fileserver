@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fileServer/internal/db"
+	"fileServer/internal/logger"
 	"net/http"
 	"time"
 
@@ -29,22 +30,11 @@ func NewHandler(database *sql.DB, jwtManager *JWTManager, accessTTL, refreshTTL 
 	}
 }
 
-type loginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"` // base64(RSA encrypted password)
-}
-
-type tokenResponse struct {
-	AccessToken string `json:"access_token"`
-}
-
-type publicKeyResponse struct {
-	PublicKey string `json:"public_key"`
-}
-
 func (h *Handler) PublicKey(w http.ResponseWriter, r *http.Request) {
+	logger.Debugf("PublicKey request from %s", r.RemoteAddr)
 	pubPEM, err := h.jwtManager.PublicKeyPEM()
 	if err != nil {
+		logger.Errorf("failed to get public key: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
@@ -55,58 +45,70 @@ func (h *Handler) PublicKey(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Debugf("Login: failed to decode request body: %v", err)
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
+	logger.Debugf("Login request for user: %s", req.Username)
 
 	ciphertext, err := base64.StdEncoding.DecodeString(req.Password)
 	if err != nil {
+		logger.Debugf("Login: failed to base64 decode password for user %s: %v", req.Username, err)
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 
 	plainPassword, err := h.jwtManager.DecryptPassword(ciphertext)
 	if err != nil {
+		logger.Debugf("Login: failed to decrypt password for user %s", req.Username)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	user, err := db.GetUserByUsername(h.db, req.Username)
 	if err != nil || user == nil {
+		logger.Debugf("Login: user not found: %s", req.Username)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(plainPassword)); err != nil {
+		logger.Debugf("Login: invalid password for user %s", req.Username)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	accessToken, err := h.jwtManager.IssueAccessToken(user.ID, user.Username, string(user.Role), h.accessTokenTTL)
 	if err != nil {
+		logger.Errorf("Login: failed to issue access token for user %s: %v", req.Username, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
 	refreshToken, err := h.jwtManager.IssueRefreshToken(user.ID, user.Username, string(user.Role), h.refreshTokenTTL)
 	if err != nil {
+		logger.Errorf("Login: failed to issue refresh token for user %s: %v", req.Username, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
 	expiresAt := time.Now().Add(h.refreshTokenTTL)
 	if err := db.SaveRefreshToken(h.db, user.ID, refreshToken, expiresAt); err != nil {
+		logger.Errorf("Login: failed to save refresh token for user %s: %v", req.Username, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
+	logger.Infof("Login: user %s (role: %s) logged in", user.Username, user.Role)
 	setRefreshTokenCookie(w, refreshToken, expiresAt)
 	writeJSON(w, http.StatusOK, tokenResponse{AccessToken: accessToken})
 }
 
 func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
+	logger.Debugf("Refresh request from %s", r.RemoteAddr)
 	cookie, err := r.Cookie(refreshTokenCookieName)
 	if err != nil {
+		logger.Debugf("Refresh: no refresh token cookie")
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -115,17 +117,20 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 
 	claims, err := h.jwtManager.Verify(refreshToken)
 	if err != nil {
+		logger.Debugf("Refresh: invalid refresh token: %v", err)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	userID, expiresAt, err := db.GetRefreshToken(h.db, refreshToken)
 	if err != nil || userID == 0 {
+		logger.Debugf("Refresh: refresh token not found in db for user %s", claims.Username)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	if time.Now().After(expiresAt) {
+		logger.Debugf("Refresh: refresh token expired for user %s", claims.Username)
 		_ = db.DeleteRefreshToken(h.db, refreshToken)
 		clearRefreshTokenCookie(w)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -134,22 +139,27 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 
 	accessToken, err := h.jwtManager.IssueAccessToken(claims.UserID, claims.Username, claims.Role, h.accessTokenTTL)
 	if err != nil {
+		logger.Errorf("Refresh: failed to issue access token for user %s: %v", claims.Username, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
+	logger.Debugf("Refresh: issued new access token for user %s", claims.Username)
 	writeJSON(w, http.StatusOK, tokenResponse{AccessToken: accessToken})
 }
 
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	logger.Debugf("Logout request from %s", r.RemoteAddr)
 	cookie, err := r.Cookie(refreshTokenCookieName)
 	if err != nil {
+		logger.Debugf("Logout: no refresh token cookie, nothing to do")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
 	_ = db.DeleteRefreshToken(h.db, cookie.Value)
 	clearRefreshTokenCookie(w)
+	logger.Infof("Logout: refresh token removed")
 	w.WriteHeader(http.StatusNoContent)
 }
 

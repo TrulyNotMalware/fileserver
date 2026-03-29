@@ -5,6 +5,8 @@ import (
 	"fileServer/configs"
 	"fileServer/internal/auth"
 	"fileServer/internal/db"
+	"fileServer/internal/file"
+	"fileServer/internal/logger"
 	"fmt"
 	"net/http"
 	"os"
@@ -57,10 +59,12 @@ func NewServer(cfg *configs.Config) (*Server, error) {
 	}
 
 	authHandler := auth.NewHandler(database, jwtManager, cfg.AccessTokenTTL, cfg.RefreshTokenTTL)
-	InitRouter(s, authHandler)
+	fileHandler := file.NewHandler(cfg.StaticDir)
+	jwtMiddleware := auth.JWTMiddleware(jwtManager)
+	InitRouter(s, authHandler, fileHandler, jwtMiddleware)
 
 	fs := http.FileServer(http.Dir(s.staticDir))
-	s.mux.Handle("GET /", auth.JWTMiddleware(s.jwtManager)(fs))
+	s.mux.Handle("GET /", jwtMiddleware(fs))
 
 	return s, nil
 }
@@ -95,6 +99,6 @@ func seedUsers(database *sql.DB, adminPassword, guestPassword string) error {
 
 func (s *Server) Run() error {
 	addr := fmt.Sprintf("%s:%s", s.host, s.port)
-	Infof("file server listening on http://%s", addr)
+	logger.Infof("file server listening on http://%s", addr)
 	return http.ListenAndServe(addr, s.mux)
 }

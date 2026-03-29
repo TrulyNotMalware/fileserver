@@ -1,4 +1,14 @@
 server:
   host: "127.0.0.1"
-  port: "80"
+  port: "8880"
   static_dir: "./static"
+
+logging:
+  level: "INFO"
+
+auth:
+  private_key_path: "your_priv_key/private.pem"
+  access_token_ttl: "15m"
+  refresh_token_ttl: "168h"
+  admin_password: "admin12345"
+  guest_password: "guest12345"
